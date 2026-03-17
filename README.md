@@ -200,7 +200,117 @@ public void importExcel(MultipartFile file, Long excelFileId, String type, Strin
 
 ---
 
-## 배운 점 / 개선하고 싶은 것
+### 6. GS 인증 결함 대응 — 보안 취약점 수정 및 HTTPS 구성
+
+**배경**
+
+TTA(한국정보통신기술협회) GS 인증 심사 과정에서 결함 리포트를 수령하고,
+해당 항목들을 직접 수정해 재심사를 통과시켰습니다.
+
+**결함 항목 및 해결 과정**
+
+---
+
+**① 비밀번호 평문 전송**
+
+로그인 시 비밀번호가 평문으로 네트워크에 전송되어 와이어샤크 등 패킷 분석 도구로 탈취 가능한 상태였습니다.
+
+서버 기동 시 RSA-2048 키쌍을 `@PostConstruct`로 1회 생성하고 공개키를 클라이언트에 제공,
+클라이언트는 Web Crypto API로 비밀번호를 RSA-OAEP(SHA-256)로 암호화해 전송하는 구조로 해결했습니다.
+
+```java
+// 서버 기동 시 RSA-2048 키쌍 1회 생성
+@PostConstruct
+public void init() {
+    KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+    kpg.initialize(2048, new SecureRandom());
+    KeyPair keyPair = kpg.generateKeyPair();
+    this.privateKey = keyPair.getPrivate();
+    this.publicKeyBase64 = Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
+}
+```
+
+`RsaDecryptionFilter`가 Spring Security 인증 흐름 앞에서 `encryptedPassword` 파라미터를 복호화해 `password`로 교체하고,
+암호화되지 않은 평문 로그인 시도는 필터 단계에서 차단합니다.
+
+```java
+// 암호화 파라미터 없으면 즉시 차단
+if (encryptedPassword == null || encryptedPassword.isBlank()) {
+    response.sendRedirect("/login?error=true");
+    return;
+}
+```
+
+---
+
+**② 비밀번호 암호화 알고리즘 — Argon2 → SHA-256 + Salt**
+
+기존에 Argon2를 사용하고 있었는데, TTA 심사 기준인 KISA 소프트웨어 개발보안 가이드에서
+허용하는 단방향 알고리즘(SHA-256, SHA-512 등)이 아니라는 결함이 접수됐습니다.
+
+Spring Security의 `PasswordEncoder` 인터페이스를 구현해 SHA-256 + SecureRandom Salt 방식의 인코더를 직접 작성했습니다.
+저장 형식은 `{salt}:{hash}`로 분리해 검증 시 동일한 Salt로 재계산 후 비교합니다.
+
+```java
+// 저장 형식: {Base64(salt)}:{Base64(SHA-256(salt + password))}
+@Override
+public String encode(CharSequence rawPassword) {
+    byte[] salt = new byte[16];
+    RANDOM.nextBytes(salt);
+    byte[] hash = digest(salt, rawPassword.toString());
+    return Base64.getEncoder().encodeToString(salt) + ":" + Base64.getEncoder().encodeToString(hash);
+}
+
+@Override
+public boolean matches(CharSequence rawPassword, String encodedPassword) {
+    String[] parts = encodedPassword.split(":", 2);
+    byte[] salt = Base64.getDecoder().decode(parts[0]);
+    byte[] expectedHash = Base64.getDecoder().decode(parts[1]);
+    byte[] actualHash = digest(salt, rawPassword.toString());
+    return MessageDigest.isEqual(expectedHash, actualHash); // 타이밍 공격 방지
+}
+```
+
+---
+
+**③ GET 방식 비밀번호 전달**
+
+URL 파라미터에 비밀번호가 포함되는 구조를 POST + RSA 암호화 전송 방식으로 전환해 해결했습니다.
+
+---
+
+**④ 필수 입력 항목 표시 미제공**
+
+위험성평가 등록 화면에서 필수 항목임에도 별표(`*`) 등의 시각적 표시가 없던 문제를 UI에서 수정했습니다.
+
+---
+
+**HTTPS 구성**
+
+결함 대응과 함께 HTTPS 환경도 직접 구성했습니다.
+
+```properties
+# TLS 1.2 / 1.3만 허용, ECDHE 기반 암호화 스위트 적용
+server.ssl.enabled=true
+server.ssl.key-store=file:./ssl/keystore.p12
+server.ssl.key-store-type=PKCS12
+server.ssl.enabled-protocols=TLSv1.2,TLSv1.3
+server.ssl.ciphers=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,...
+
+# 세션 쿠키 보안
+server.servlet.session.cookie.secure=true
+server.servlet.session.cookie.http-only=true
+```
+
+프로덕션 환경에서는 키스토어 비밀번호를 환경변수(`${SSL_KEYSTORE_PASSWORD}`)로 분리해 소스코드에 노출되지 않도록 했습니다.
+
+**배운 점**
+
+GS 인증은 기능 동작 여부가 아니라 보안 기준 충족 여부를 검증합니다.
+Argon2가 더 강력한 알고리즘임에도 KISA 가이드 기준 비허용이라는 이유로 결함 처리된 것이 인상적이었고,
+공공 SI에서 보안이 성능보다 규정 준수 기준으로 평가된다는 점을 실감했습니다.
+
+---
 
 초기 공통 모듈을 잡지 않았다면 팀원마다 예외 처리와 로그 형식이 제각각인 코드가 됐을 것입니다.
 규칙을 초반에 정해두는 것이 나중에 합칠 때 충돌을 얼마나 줄여주는지 직접 경험했습니다.
