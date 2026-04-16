@@ -15,7 +15,7 @@
 |---|---|
 | Language | Java 17 |
 | Framework | Spring Boot 3.x, Spring Security, Spring WebSocket |
-| ORM | MyBatis + JPA (혼용) |
+| ORM | MyBatis |
 | DB | PostgreSQL (멀티 데이터소스) |
 | Infra | Jenkins CI/CD, Linux, Synology NAS (내부 Git 서버) |
 | 리포팅 | OZ Report 9.0 |
@@ -45,7 +45,7 @@
 
 **배경**
 
-공공 SI 특성상 외부 GitHub을 쓸 수 없어 Synology NAS에 내부 Git 서버를 구성했고, 배포 대상은 별도 Windows 운영 서버였습니다.
+회사 방침상 외부 GitHub을 쓸 수 없어 Synology NAS에 내부 Git 서버가 구성되어 있었고, 배포 대상은 별도 Windows 개발 서버였습니다.
 기존에는 빌드 파일을 직접 복사하는 수동 배포 방식이어서 배포 누락, 구버전 잔존 문제가 반복됐습니다.
 
 **구성**
@@ -59,19 +59,6 @@ Jenkins (빌드 서버)
 Windows 배포 서버
 ↓  구버전 프로세스 종료 (WMIC)
 ↓  신버전 JAR 실행
-```
-
-**핵심 문제: Windows 환경에서 프로세스 격리**
-
-Linux와 달리 Windows에서는 PID 파일 방식이 불안정해 구버전 JAR를 정확히 종료하기 어려웠습니다.
-WMIC로 JAR 파일명 기준으로 프로세스를 특정해 종료하는 방식으로 해결했습니다.
-
-```bash
-# 구버전 프로세스 종료
-wmic process where "commandline like '%GH-DisasterSafe%'" delete
-
-# 신버전 실행
-start javaw -jar GH-DisasterSafe.jar
 ```
 
 **결과**
@@ -102,39 +89,13 @@ common
 └── util        # FileUtil, FieldCryptoUtil, FileCryptoUtil
 ```
 
-**예외 처리 표준화**
-
-`ErrorCode` enum으로 에러 코드와 HTTP 상태를 한 곳에서 관리하고,
-`@RestControllerAdvice`에서 예외 종류별로 일괄 처리하는 구조를 잡았습니다.
-팀원들은 `BusinessException`만 throw하면 일관된 응답이 내려갑니다.
-
-```java
-// 비즈니스 예외는 ErrorCode와 함께 throw
-@ExceptionHandler(BusinessException.class)
-public ResponseEntity<Result<Void>> handleBusiness(BusinessException e, HttpServletRequest request) {
-    return build(e.getCode(), e.getMessage(), e, request);
-}
-
-// API vs 웹 요청 구분 처리 — 404도 요청 유형에 따라 다르게 응답
-@ExceptionHandler(NoResourceFoundException.class)
-public ResponseEntity<Result<Void>> handleNoResourceFound(NoResourceFoundException e, HttpServletRequest request) throws NoResourceFoundException {
-    if (isApiRequest(request)) {
-        return build(ErrorCode.NOT_FOUND, "요청한 페이지를 찾을 수 없습니다", e, request);
-    }
-    throw e; // 웹 요청은 Spring Boot 기본 에러 페이지로 위임
-}
-```
-
-API 요청과 일반 웹 요청을 URL 패턴과 Accept 헤더로 구분해,
-REST 응답과 HTML 에러 페이지를 각각 내려주도록 처리한 점이 포인트였습니다.
-
 ---
 
-### 4. OZ Report 개발 서버 구축 및 웹 연동
+### 3. OZ Report 개발 서버 구축 및 웹 연동
 
 **배경**
 
-공공 프로젝트에서 보고서 출력은 OZ Report가 표준입니다.
+프로젝트에서 보고서 출력을 외부 OZ Report를 사용했습니다.
 단순 API 호출이 아니라 OZ Report 서버 구성부터 Spring Boot 연동까지 전 과정을 직접 담당했습니다.
 
 **진행한 작업**
@@ -155,7 +116,7 @@ OZ Report 레퍼런스가 거의 없어 공식 매뉴얼과 직접 디버깅으�
 
 ---
 
-### 5. 보건관리 엑셀 파싱 → DB 일괄 적재
+### 4. 보건관리 엑셀 파싱 → DB 일괄 적재
 
 **배경**
 
@@ -188,19 +149,9 @@ public void importExcel(MultipartFile file, Long excelFileId, String type, Strin
 }
 ```
 
-**병합 셀 처리**
-
-실무 엑셀에는 병합 셀이 많아 단순 `row.getCell(col)` 로는 빈 값으로 읽히는 문제가 있었습니다.
-`getMergedAwareCell()`로 병합 영역을 검사해 첫 번째 셀의 값을 읽도록 처리했습니다.
-
-**한계**
-
-전체 시트를 메모리에 올려 파싱하는 구조라 수만 건 이상이면 OOM 위험이 있습니다.
-대용량 처리가 필요하면 Apache POI의 SAX 방식(streaming) 또는 Spring Batch 청크 처리로 교체해야 합니다.
-
 ---
 
-### 6. GS 인증 결함 대응 — 보안 취약점 수정 및 HTTPS 구성
+### 5. GS 인증 결함 대응 — 보안 취약점 수정 및 HTTPS 구성
 
 **배경**
 
@@ -304,26 +255,5 @@ server.servlet.session.cookie.http-only=true
 
 프로덕션 환경에서는 키스토어 비밀번호를 환경변수(`${SSL_KEYSTORE_PASSWORD}`)로 분리해 소스코드에 노출되지 않도록 했습니다.
 
-**배운 점**
-
-GS 인증은 기능 동작 여부가 아니라 보안 기준 충족 여부를 검증합니다.
-Argon2가 더 강력한 알고리즘임에도 KISA 가이드 기준 비허용이라는 이유로 결함 처리된 것이 인상적이었고,
-공공 SI에서 보안이 성능보다 규정 준수 기준으로 평가된다는 점을 실감했습니다.
-
 ---
 
-초기 공통 모듈을 잡지 않았다면 팀원마다 예외 처리와 로그 형식이 제각각인 코드가 됐을 것입니다.
-규칙을 초반에 정해두는 것이 나중에 합칠 때 충돌을 얼마나 줄여주는지 직접 경험했습니다.
-
-Jenkins 구성 전 수동 배포 중 구버전이 남은 채로 서비스가 뜨는 사고를 겪었습니다.
-그 뒤로 배포 프로세스를 코드로 관리하는 것이 편의가 아니라 신뢰성의 문제라는 걸 알게 됐습니다.
-
-| 항목 | 현재 | 개선 방향 |
-|---|---|---|
-| 배포 환경 | Windows + WMIC | Linux + Docker |
-| 배포 방식 | JAR 직접 실행 | Blue-Green 무중단 배포 |
-| 분산 트랜잭션 | 미적용 | JTA (Atomikos) |
-| 테스트 | 미작성 | JUnit5 + Mockito |
-
-Windows + WMIC 방식은 동작은 하지만 처음부터 Linux + Docker 환경이었다면 훨씬 안정적인 구조가 됐을 것 같습니다.
-다음 프로젝트에서는 컨테이너 환경을 전제로 설계하고 싶습니다.
